@@ -1,0 +1,1007 @@
+#!/usr/bin/env python3
+"""OneDNS CLI — Enterprise DNS management for onedns.io"""
+
+import os
+import sys
+import json
+import argparse
+import configparser
+import getpass
+from pathlib import Path
+
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+CONFIG_PATH = Path.home() / ".config" / "onedns" / "config"
+BASE_URL = os.environ.get("ONEDNS_URL", "https://onedns.io")
+API_BASE = f"{BASE_URL}/api/v1"
+
+VERSION = "2.0.0"
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def _read_config():
+    cfg = configparser.ConfigParser()
+    if CONFIG_PATH.exists():
+        cfg.read(CONFIG_PATH)
+    return cfg
+
+
+def load_api_key():
+    key = os.environ.get("ONEDNS_API_KEY")
+    if key:
+        return key
+    cfg = _read_config()
+    key = cfg.get("default", "api_key", fallback=None)
+    if key:
+        return key
+    die("Not authenticated. Run: onedns login")
+
+
+def save_config(api_key):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    cfg = configparser.ConfigParser()
+    cfg["default"] = {"api_key": api_key}
+    with open(CONFIG_PATH, "w") as f:
+        cfg.write(f)
+
+
+def clear_config():
+    if CONFIG_PATH.exists():
+        CONFIG_PATH.unlink()
+
+
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+
+def api(method, path, api_key=None, raw=False, **kwargs):
+    if api_key is None:
+        api_key = load_api_key()
+    url = f"{API_BASE}{path}" if not path.startswith("http") else path
+    headers = {"X-API-Key": api_key}
+    if "json" in kwargs:
+        headers["Content-Type"] = "application/json"
+    resp = requests.request(method, url, headers=headers, verify=False, **kwargs)
+    if resp.status_code == 401:
+        die("Authentication failed — run: onedns login")
+    if resp.status_code == 403:
+        die("Access denied")
+    if resp.status_code == 404:
+        die(f"Not found: {path}")
+    if resp.status_code >= 400:
+        body = {}
+        try:
+            body = resp.json()
+        except Exception:
+            pass
+        die(f"API error {resp.status_code}: {body.get('error', body.get('message', resp.text))}")
+    if raw:
+        return resp.text
+    return resp.json() if resp.content else {}
+
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def ok(msg):
+    print(msg)
+
+
+def print_json(data):
+    print(json.dumps(data, indent=2))
+
+
+def print_table(rows, headers):
+    if not rows:
+        return
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    print("  ".join("-" * w for w in widths))
+    for row in rows:
+        print(fmt.format(*[str(c) for c in row]))
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def find_zone_id(name):
+    """Resolve zone name or ID → integer ID."""
+    try:
+        return int(name)
+    except ValueError:
+        pass
+    data = api("GET", "/zones")
+    for z in data.get("zones", []):
+        if z["name"].rstrip(".") == name.rstrip("."):
+            return z["id"]
+    die(f"Zone not found: {name}")
+
+
+def _zone_arg(p, positional=True):
+    if positional:
+        p.add_argument("zone", help="Zone name or ID")
+    else:
+        p.add_argument("--zone", required=True, help="Zone name or ID")
+
+
+# =============================================================================
+# Auth
+# =============================================================================
+
+def cmd_login(args):
+    """Save an API key (prompts if not provided)."""
+    key = args.api_key
+    if not key:
+        print("Get your API key at https://onedns.io/settings/api-keys")
+        key = getpass.getpass("API key: ").strip()
+    if not key:
+        die("API key cannot be empty")
+    try:
+        api("GET", "/zones", api_key=key)
+    except SystemExit:
+        die("Invalid API key")
+    save_config(key)
+    ok("Logged in. API key saved.")
+
+
+def cmd_logout(args):
+    clear_config()
+    ok("Logged out.")
+
+
+def cmd_whoami(args):
+    data = api("GET", "/settings/api-keys")
+    keys = data.get("api_keys", data.get("keys", []))
+    if keys:
+        ok(f"Authenticated via API key ({len(keys)} key(s) on account)")
+    else:
+        ok("Authenticated")
+
+
+# =============================================================================
+# API Keys
+# =============================================================================
+
+def cmd_apikeys_list(args):
+    data = api("GET", "/settings/api-keys")
+    keys = data.get("api_keys", data.get("keys", []))
+    if not keys:
+        ok("No API keys found.")
+        return
+    rows = [(k.get("id"), k.get("name", ""), k.get("created_at", ""), k.get("last_used", "never")) for k in keys]
+    print_table(rows, ["ID", "NAME", "CREATED", "LAST USED"])
+
+
+def cmd_apikeys_create(args):
+    payload = {"name": args.name}
+    if args.expires:
+        payload["expires_in_days"] = args.expires
+    data = api("POST", "/settings/api-keys", json=payload)
+    ok(f"Created API key: {data.get('key', data.get('api_key', ''))}")
+    ok(f"  ID:   {data.get('id')}")
+    ok(f"  Name: {data.get('name')}")
+    ok("Save this key — it won't be shown again.")
+
+
+def cmd_apikeys_revoke(args):
+    api("DELETE", f"/settings/api-keys/{args.key_id}")
+    ok(f"Revoked API key {args.key_id}")
+
+
+# =============================================================================
+# Zones
+# =============================================================================
+
+def cmd_zones_list(args):
+    data = api("GET", "/zones")
+    zones = data.get("zones", [])
+    if not zones:
+        ok("No zones found.")
+        return
+    rows = [(z["id"], z["name"], z.get("provider", ""), z.get("status", ""), z.get("record_count", "")) for z in zones]
+    print_table(rows, ["ID", "NAME", "PROVIDER", "STATUS", "RECORDS"])
+
+
+def cmd_zones_get(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}")
+    print_json(data)
+
+
+def cmd_zones_create(args):
+    payload = {"name": args.domain}
+    if args.provider:
+        payload["provider"] = args.provider
+    data = api("POST", "/zones", json=payload)
+    z = data.get("zone", data)
+    ok(f"Created zone {z.get('id')}: {z.get('name')} (provider: {z.get('provider', 'default')})")
+
+
+def cmd_zones_delete(args):
+    zone_id = find_zone_id(args.zone)
+    confirm = input(f"Delete zone {args.zone}? This cannot be undone. Type zone name to confirm: ").strip()
+    if confirm.rstrip(".") != args.zone.rstrip(".") and confirm != str(zone_id):
+        die("Aborted.")
+    api("DELETE", f"/zones/{zone_id}")
+    ok(f"Deleted zone {args.zone}")
+
+
+def cmd_zones_verify(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("POST", f"/zones/{zone_id}/verify")
+    ok(json.dumps(data, indent=2))
+
+
+def cmd_zones_sync(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("POST", f"/zones/{zone_id}/sync")
+    ok(json.dumps(data, indent=2))
+
+
+def cmd_zones_export(args):
+    zone_id = find_zone_id(args.zone)
+    text = api("GET", f"/zones/{zone_id}/export", raw=True)
+    if args.output:
+        Path(args.output).write_text(text)
+        ok(f"Exported to {args.output}")
+    else:
+        print(text)
+
+
+def cmd_zones_import(args):
+    zone_id = find_zone_id(args.zone)
+    content = Path(args.file).read_text()
+    payload = {"content": content, "format": args.format}
+    data = api("POST", f"/zones/{zone_id}/import", json=payload)
+    ok(json.dumps(data, indent=2))
+
+
+def cmd_zones_history(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/history")
+    events = data.get("history", data.get("events", []))
+    if not events:
+        ok("No history found.")
+        return
+    rows = [(e.get("id", ""), e.get("action", ""), e.get("user", ""), e.get("created_at", ""), e.get("summary", "")) for e in events]
+    print_table(rows, ["ID", "ACTION", "USER", "WHEN", "SUMMARY"])
+
+
+# =============================================================================
+# Records
+# =============================================================================
+
+def cmd_records_list(args):
+    zone_id = find_zone_id(args.zone)
+    params = {}
+    if args.type:
+        params["type"] = args.type.upper()
+    data = api("GET", f"/zones/{zone_id}/records", params=params)
+    records = data.get("records", [])
+    if not records:
+        ok("No records found.")
+        return
+    rows = [
+        (r["id"], r.get("name", "@"), r["type"], r["content"][:60], r.get("ttl", ""), r.get("proxied", ""))
+        for r in records
+    ]
+    print_table(rows, ["ID", "NAME", "TYPE", "CONTENT", "TTL", "PROXIED"])
+
+
+def cmd_record_create(args):
+    zone_id = find_zone_id(args.zone)
+    payload = {
+        "type": args.type.upper(),
+        "name": args.name,
+        "content": args.content,
+        "ttl": args.ttl,
+        "proxied": args.proxied,
+    }
+    if args.priority is not None:
+        payload["priority"] = args.priority
+    r = api("POST", f"/zones/{zone_id}/records", json=payload)
+    record = r.get("record", r)
+    ok(f"Created record {record.get('id')}: {record.get('name')} {record.get('type')} {record.get('content')}")
+
+
+def cmd_record_update(args):
+    zone_id = find_zone_id(args.zone)
+    payload = {}
+    if args.content:
+        payload["content"] = args.content
+    if args.ttl:
+        payload["ttl"] = args.ttl
+    if args.name:
+        payload["name"] = args.name
+    if args.type:
+        payload["type"] = args.type.upper()
+    if args.proxied is not None:
+        payload["proxied"] = args.proxied
+    if not payload:
+        die("Nothing to update — provide at least one of --content, --ttl, --name, --type")
+    r = api("PUT", f"/zones/{zone_id}/records/{args.record_id}", json=payload)
+    record = r.get("record", r)
+    ok(f"Updated record {record.get('id')}: {record.get('name')} {record.get('type')} {record.get('content')}")
+
+
+def cmd_record_delete(args):
+    zone_id = find_zone_id(args.zone)
+    api("DELETE", f"/zones/{zone_id}/records/{args.record_id}")
+    ok(f"Deleted record {args.record_id}")
+
+
+def cmd_record_set(args):
+    """Upsert: update existing records matching name+type, or create."""
+    zone_id = find_zone_id(args.zone)
+    rtype = args.type.upper()
+    data = api("GET", f"/zones/{zone_id}/records", params={"type": rtype})
+    records = data.get("records", [])
+    name = args.name.rstrip(".")
+    matches = [
+        r for r in records
+        if r.get("name", "").rstrip(".") in (name, f"{name}.{args.zone.rstrip('.')}")
+           or (name == "@" and r.get("name", "") in ("@", args.zone.rstrip(".")))
+    ]
+    if matches:
+        for r in matches:
+            updated = api("PUT", f"/zones/{zone_id}/records/{r['id']}", json={"content": args.content, "ttl": args.ttl})
+            rec = updated.get("record", updated)
+            ok(f"Updated {rec.get('name')} {rec.get('type')} → {rec.get('content')}")
+    else:
+        created = api("POST", f"/zones/{zone_id}/records", json={
+            "type": rtype, "name": name, "content": args.content, "ttl": args.ttl, "proxied": False
+        })
+        rec = created.get("record", created)
+        ok(f"Created {rec.get('name')} {rec.get('type')} → {rec.get('content')}")
+
+
+# =============================================================================
+# DNSSEC
+# =============================================================================
+
+def cmd_dnssec_enable(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("POST", f"/zones/{zone_id}/dnssec")
+    print_json(data)
+
+
+def cmd_dnssec_status(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}")
+    dnssec = data.get("dnssec", data.get("zone", {}).get("dnssec", {}))
+    print_json(dnssec)
+
+
+def cmd_dnssec_get_ds(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}")
+    dnssec = data.get("dnssec", data.get("zone", {}).get("dnssec", {}))
+    ds = dnssec.get("ds_record") or dnssec.get("ds") or dnssec
+    print_json(ds)
+
+
+# =============================================================================
+# Zone Transfers
+# =============================================================================
+
+def cmd_transfers_list(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/transfers")
+    transfers = data.get("transfers", [])
+    if not transfers:
+        ok("No zone transfers configured.")
+        return
+    rows = [(t.get("id"), t.get("type"), t.get("peer"), t.get("status"), t.get("last_run", "")) for t in transfers]
+    print_table(rows, ["ID", "TYPE", "PEER", "STATUS", "LAST RUN"])
+
+
+def cmd_transfers_pull(args):
+    zone_id = find_zone_id(args.zone)
+    payload = {"primary": args.primary}
+    if args.tsig_key:
+        payload["tsig_key"] = args.tsig_key
+    data = api("POST", f"/zones/{zone_id}/transfers/pull", json=payload)
+    print_json(data)
+
+
+def cmd_transfers_push(args):
+    zone_id = find_zone_id(args.zone)
+    payload = {"secondary": args.secondary}
+    if args.tsig_key:
+        payload["tsig_key"] = args.tsig_key
+    data = api("POST", f"/zones/{zone_id}/transfers/push", json=payload)
+    print_json(data)
+
+
+# =============================================================================
+# Analytics
+# =============================================================================
+
+def cmd_analytics(args):
+    zone_id = find_zone_id(args.zone)
+    params = {"days": args.days}
+    data = api("GET", f"/zones/{zone_id}/analytics", params=params)
+    print_json(data)
+
+
+# =============================================================================
+# Intel / Threat
+# =============================================================================
+
+def cmd_intel_reputation(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/threats/reputation")
+    print_json(data)
+
+
+def cmd_intel_passive_dns(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/threats/passive-dns", params={"limit": args.limit})
+    print_json(data)
+
+
+def cmd_intel_malware(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/threats/malware")
+    print_json(data)
+
+
+def cmd_intel_subdomains(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/threats/subdomains")
+    print_json(data)
+
+
+def cmd_intel_summary(args):
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/threats/summary", params={"days": args.days})
+    print_json(data)
+
+
+# =============================================================================
+# Firewall (per-zone WAF via darkapi)
+# =============================================================================
+
+def cmd_firewall_rules_list(args):
+    """List per-zone DNS firewall rules (stored in platform, synced to dnsscienced)."""
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/dns-firewall/rules")
+    rules = data.get("rules", [])
+    if not rules:
+        ok("No DNS firewall rules.")
+        return
+    rows = [
+        (r.get("id"), r.get("priority", ""), r.get("action"), r.get("domain_suffix", ""),
+         r.get("client_cidr", ""), r.get("query_type", ""), r.get("enabled", True))
+        for r in rules
+    ]
+    print_table(rows, ["ID", "PRI", "ACTION", "DOMAIN", "CIDR", "TYPE", "ENABLED"])
+
+
+def cmd_firewall_rules_add(args):
+    """Add a per-zone DNS firewall rule."""
+    zone_id = find_zone_id(args.zone)
+    rule = {"action": args.action}
+    if args.domain:
+        rule["domain_suffix"] = args.domain
+    if args.cidr:
+        rule["client_cidr"] = args.cidr
+    if args.type:
+        rule["query_type"] = args.type.upper()
+    if args.name:
+        rule["name"] = args.name
+    if args.priority:
+        rule["priority"] = args.priority
+    data = api("POST", f"/zones/{zone_id}/dns-firewall/rules", json=rule)
+    rule_obj = data.get("rule", data)
+    ok(f"Created firewall rule {rule_obj.get('id')}: {rule_obj.get('action')} (priority {rule_obj.get('priority')})")
+
+
+def cmd_firewall_rules_delete(args):
+    """Delete a per-zone DNS firewall rule."""
+    zone_id = find_zone_id(args.zone)
+    api("DELETE", f"/zones/{zone_id}/dns-firewall/rules/{args.rule_id}")
+    ok(f"Deleted firewall rule {args.rule_id}")
+
+
+def cmd_firewall_stats(args):
+    """WAF stats (darkapi.io — HTTP-layer WAF, separate from DNS firewall)."""
+    zone_id = find_zone_id(args.zone)
+    data = api("GET", f"/zones/{zone_id}/firewall/stats", params={"days": args.days})
+    print_json(data)
+
+
+# =============================================================================
+# ThreatScript
+# =============================================================================
+
+def cmd_script_push(args):
+    path = Path(args.file)
+    if not path.exists():
+        die(f"File not found: {args.file}")
+    content = path.read_text()
+    script_id = args.id or path.stem
+    payload = {"script_id": script_id, "body": content}
+    if args.name:
+        payload["name"] = args.name
+    data = api("POST", "/dnsscienced/firewall/scripts", json=payload)
+    ok(f"Loaded ThreatScript '{script_id}'")
+    if data:
+        print_json(data)
+
+
+def cmd_script_delete(args):
+    api("DELETE", f"/dnsscienced/firewall/scripts/{args.script_id}")
+    ok(f"Removed ThreatScript '{args.script_id}'")
+
+
+def cmd_script_stats(args):
+    data = api("GET", "/dnsscienced/firewall/stats")
+    print_json(data)
+
+
+# =============================================================================
+# Server (dnsscienced admin)
+# =============================================================================
+
+def cmd_server_status(args):
+    data = api("GET", "/dnsscienced/status")
+    print_json(data)
+
+
+def cmd_server_stats(args):
+    data = api("GET", "/dnsscienced/stats")
+    print_json(data)
+
+
+def cmd_server_metrics(args):
+    text = api("GET", "/dnsscienced/metrics", raw=True)
+    print(text)
+
+
+def cmd_server_reload(args):
+    data = api("POST", "/dnsscienced/reload")
+    ok(json.dumps(data, indent=2))
+
+
+def cmd_server_license(args):
+    data = api("GET", "/dnsscienced/license")
+    print_json(data)
+
+
+# =============================================================================
+# Cache
+# =============================================================================
+
+def cmd_cache_stats(args):
+    data = api("GET", "/dnsscienced/cache/stats")
+    print_json(data)
+
+
+def cmd_cache_flush(args):
+    payload = {"scope": "ALL"}
+    if args.domain:
+        payload["scope"] = "DOMAIN"
+        payload["domain"] = args.domain
+        payload["include_subdomains"] = not args.exact
+    if args.type:
+        payload["type"] = args.type.upper()
+    data = api("POST", "/dnsscienced/cache/flush", json=payload)
+    ok(json.dumps(data, indent=2))
+
+
+def cmd_cache_lookup(args):
+    params = {"name": args.domain}
+    if args.type:
+        params["type"] = args.type.upper()
+    data = api("GET", "/dnsscienced/cache/lookup", params=params)
+    print_json(data)
+
+
+def cmd_cache_prefetch(args):
+    payload = {"domains": [args.domain]}
+    if args.type:
+        payload["type"] = args.type.upper()
+    data = api("POST", "/dnsscienced/cache/prefetch", json=payload)
+    ok(json.dumps(data, indent=2))
+
+
+# =============================================================================
+# Domains (registration)
+# =============================================================================
+
+def cmd_domains_list(args):
+    data = api("GET", "/domains")
+    domains = data.get("domains", [])
+    if not domains:
+        ok("No registered domains.")
+        return
+    rows = [(d.get("domain"), d.get("status"), d.get("expires"), d.get("auto_renew", "")) for d in domains]
+    print_table(rows, ["DOMAIN", "STATUS", "EXPIRES", "AUTO RENEW"])
+
+
+def cmd_domains_check(args):
+    data = api("GET", f"/domains/check/{args.domain}")
+    available = data.get("available", data.get("status") == "available")
+    price = data.get("price", data.get("register_price", ""))
+    status = "available" if available else "taken"
+    suffix = f"  (price: {price})" if available and price else ""
+    ok(f"{args.domain}: {status}{suffix}")
+
+
+def cmd_domains_nameservers(args):
+    payload = {"nameservers": args.ns}
+    data = api("PUT", f"/domains/{args.domain}/nameservers", json=payload)
+    ok(json.dumps(data, indent=2))
+
+
+def cmd_domains_auth_code(args):
+    data = api("GET", f"/domains/{args.domain}/auth-code")
+    code = data.get("auth_code", data.get("code", ""))
+    ok(f"Auth code for {args.domain}: {code}")
+
+
+# =============================================================================
+# Rate Limiting
+# =============================================================================
+
+def cmd_ratelimit_get(args):
+    data = api("GET", "/dnsscienced/ratelimit")
+    print_json(data)
+
+
+def cmd_ratelimit_set(args):
+    payload = {}
+    if args.qps:
+        payload["queries_per_second"] = args.qps
+    if args.burst:
+        payload["burst"] = args.burst
+    if args.enabled is not None:
+        payload["enabled"] = args.enabled
+    data = api("PUT", "/dnsscienced/ratelimit", json=payload)
+    ok(json.dumps(data, indent=2))
+
+
+# =============================================================================
+# Parser
+# =============================================================================
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="onedns",
+        description="OneDNS CLI — Enterprise DNS management",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Docs: https://onedns.io/cli\nAPI keys: https://onedns.io/settings/api-keys"
+    )
+    parser.add_argument("--version", action="version", version=f"onedns {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
+
+    # ── login / logout / whoami ───────────────────────────────────────────────
+    p = sub.add_parser("login", help="Authenticate with an API key")
+    p.add_argument("--api-key", dest="api_key", help="API key (will prompt if omitted)")
+    p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("logout", help="Remove saved credentials")
+    p.set_defaults(func=cmd_logout)
+
+    p = sub.add_parser("whoami", help="Show current authentication status")
+    p.set_defaults(func=cmd_whoami)
+
+    # ── configure (legacy alias for login) ───────────────────────────────────
+    p = sub.add_parser("configure", help="Set API key (alias for login)")
+    p.add_argument("--api-key", dest="api_key", help="API key (will prompt if omitted)")
+    p.set_defaults(func=cmd_login)
+
+    # ── api-keys ──────────────────────────────────────────────────────────────
+    pak = sub.add_parser("api-keys", help="Manage API keys")
+    aksub = pak.add_subparsers(dest="apikeys_cmd", required=True, metavar="<subcommand>")
+
+    p = aksub.add_parser("list", help="List API keys on your account")
+    p.set_defaults(func=cmd_apikeys_list)
+
+    p = aksub.add_parser("create", help="Create a new API key")
+    p.add_argument("--name", required=True, help="Key name/label")
+    p.add_argument("--expires", type=int, metavar="DAYS", help="Expire after N days")
+    p.set_defaults(func=cmd_apikeys_create)
+
+    p = aksub.add_parser("revoke", help="Revoke an API key")
+    p.add_argument("key_id", help="API key ID")
+    p.set_defaults(func=cmd_apikeys_revoke)
+
+    # ── zones ─────────────────────────────────────────────────────────────────
+    pz = sub.add_parser("zones", help="Zone management")
+    zsub = pz.add_subparsers(dest="zones_cmd", required=True, metavar="<subcommand>")
+
+    p = zsub.add_parser("list", help="List all zones")
+    p.set_defaults(func=cmd_zones_list)
+
+    p = zsub.add_parser("get", help="Get zone details")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_zones_get)
+
+    p = zsub.add_parser("create", help="Create a zone")
+    p.add_argument("domain", help="Domain name")
+    p.add_argument("--provider", help="DNS provider (cloudflare, bunny, dnsscienced)")
+    p.set_defaults(func=cmd_zones_create)
+
+    p = zsub.add_parser("delete", help="Delete a zone")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_zones_delete)
+
+    p = zsub.add_parser("verify", help="Verify NS delegation")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_zones_verify)
+
+    p = zsub.add_parser("sync", help="Force sync zone to provider")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_zones_sync)
+
+    p = zsub.add_parser("export", help="Export zone as BIND zone file")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--output", "-o", metavar="FILE", help="Write to file (default: stdout)")
+    p.set_defaults(func=cmd_zones_export)
+
+    p = zsub.add_parser("import", help="Import records from a zone file")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--file", "-f", required=True, metavar="FILE", help="Zone file to import")
+    p.add_argument("--format", default="bind", choices=["bind", "dnsscienced"], help="Zone file format")
+    p.set_defaults(func=cmd_zones_import)
+
+    p = zsub.add_parser("history", help="Zone change history")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_zones_history)
+
+    # ── records ───────────────────────────────────────────────────────────────
+    pr = sub.add_parser("records", help="DNS record management")
+    rsub = pr.add_subparsers(dest="records_cmd", required=True, metavar="<subcommand>")
+
+    p = rsub.add_parser("list", help="List records in a zone")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--type", help="Filter by record type (A, AAAA, CNAME, MX, TXT, NS, PTR, SRV, CAA, TLSA, SSHFP, NAPTR, HTTPS, SVCB, SMIMEA, CERT, HINFO, IPSECKEY, OPENPGPKEY, URI, EUI48, EUI64, CDS, CDNSKEY, ZONEMD, CSYNC, RP, AFSDB, KX, DHCID, APL, LOC, or any valid DNS type)")
+    p.set_defaults(func=cmd_records_list)
+
+    p = rsub.add_parser("create", help="Create a DNS record")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--type", required=True, help="Record type")
+    p.add_argument("--name", required=True, help="Record name (@ for root)")
+    p.add_argument("--content", required=True, help="Record value")
+    p.add_argument("--ttl", type=int, default=300)
+    p.add_argument("--priority", type=int, help="Priority (MX, SRV)")
+    p.add_argument("--proxied", action="store_true", default=False)
+    p.set_defaults(func=cmd_record_create)
+
+    p = rsub.add_parser("update", help="Update a DNS record")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("record_id", type=int, help="Record ID")
+    p.add_argument("--type")
+    p.add_argument("--name")
+    p.add_argument("--content")
+    p.add_argument("--ttl", type=int)
+    p.add_argument("--proxied", type=lambda x: x.lower() == "true")
+    p.set_defaults(func=cmd_record_update)
+
+    p = rsub.add_parser("delete", help="Delete a DNS record")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("record_id", type=int, help="Record ID")
+    p.set_defaults(func=cmd_record_delete)
+
+    p = rsub.add_parser("set", help="Create or update a record by name (upsert)")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--type", required=True)
+    p.add_argument("--name", required=True, help="Record name (@ for root)")
+    p.add_argument("--content", required=True)
+    p.add_argument("--ttl", type=int, default=300)
+    p.set_defaults(func=cmd_record_set)
+
+    # ── dnssec ────────────────────────────────────────────────────────────────
+    pds = sub.add_parser("dnssec", help="DNSSEC management")
+    dssub = pds.add_subparsers(dest="dnssec_cmd", required=True, metavar="<subcommand>")
+
+    p = dssub.add_parser("enable", help="Enable DNSSEC for a zone")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_dnssec_enable)
+
+    p = dssub.add_parser("status", help="Show DNSSEC status for a zone")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_dnssec_status)
+
+    p = dssub.add_parser("get-ds", help="Get DS records for registrar configuration")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_dnssec_get_ds)
+
+    # ── transfers ─────────────────────────────────────────────────────────────
+    pxf = sub.add_parser("transfers", help="Zone transfer management")
+    xfsub = pxf.add_subparsers(dest="transfers_cmd", required=True, metavar="<subcommand>")
+
+    p = xfsub.add_parser("list", help="List zone transfer configurations")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_transfers_list)
+
+    p = xfsub.add_parser("pull", help="Configure AXFR pull (secondary)")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--primary", required=True, help="Primary nameserver IP:port")
+    p.add_argument("--tsig-key", dest="tsig_key", help="TSIG key name for authentication")
+    p.set_defaults(func=cmd_transfers_pull)
+
+    p = xfsub.add_parser("push", help="Configure AXFR push (notify secondary)")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--secondary", required=True, help="Secondary nameserver IP:port")
+    p.add_argument("--tsig-key", dest="tsig_key", help="TSIG key name for authentication")
+    p.set_defaults(func=cmd_transfers_push)
+
+    # ── analytics ─────────────────────────────────────────────────────────────
+    p = sub.add_parser("analytics", help="Zone query analytics")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7)")
+    p.set_defaults(func=cmd_analytics)
+
+    # ── intel ─────────────────────────────────────────────────────────────────
+    pi = sub.add_parser("intel", help="Threat intelligence per zone")
+    isub = pi.add_subparsers(dest="intel_cmd", required=True, metavar="<subcommand>")
+
+    p = isub.add_parser("reputation", help="Domain reputation and risk score")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_intel_reputation)
+
+    p = isub.add_parser("passive-dns", help="Passive DNS history")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--limit", type=int, default=50, help="Max records to return")
+    p.set_defaults(func=cmd_intel_passive_dns)
+
+    p = isub.add_parser("malware", help="Malware and C2 association check")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_intel_malware)
+
+    p = isub.add_parser("subdomains", help="Known subdomain threat intel")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_intel_subdomains)
+
+    p = isub.add_parser("summary", help="Aggregated zone threat summary")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_intel_summary)
+
+    # ── firewall ──────────────────────────────────────────────────────────────
+    pfw = sub.add_parser("firewall", help="Per-zone DNS firewall (WAF) management")
+    fwsub = pfw.add_subparsers(dest="firewall_cmd", required=True, metavar="<subcommand>")
+
+    p = fwsub.add_parser("rules", help="List firewall rules for a zone")
+    p.add_argument("zone", help="Zone name or ID")
+    p.set_defaults(func=cmd_firewall_rules_list)
+
+    p = fwsub.add_parser("add", help="Add a DNS firewall rule to a zone")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--action", required=True, choices=["allow", "block", "nxdomain", "drop", "rewrite", "redirect"],
+                   help="Rule action")
+    p.add_argument("--domain", help="Match domain suffix (e.g. evil.com)")
+    p.add_argument("--cidr", help="Match client source CIDR (e.g. 10.0.0.0/8)")
+    p.add_argument("--type", help="Match query type (A, AAAA, MX, CNAME, TXT, SRV, CAA, TLSA, HTTPS, SVCB, CERT, HINFO, IPSECKEY, OPENPGPKEY, URI, EUI48, EUI64, CDS, CDNSKEY, ZONEMD, CSYNC, RP, AFSDB, KX, DHCID, APL, or any valid DNS type)")
+    p.add_argument("--name", help="Rule name/label")
+    p.add_argument("--priority", type=int, default=100, help="Evaluation priority (lower = first, default: 100)")
+    p.set_defaults(func=cmd_firewall_rules_add)
+
+    p = fwsub.add_parser("delete", help="Delete a DNS firewall rule")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("rule_id", type=int, help="Rule ID")
+    p.set_defaults(func=cmd_firewall_rules_delete)
+
+    p = fwsub.add_parser("stats", help="WAF traffic and block statistics (darkapi.io)")
+    p.add_argument("zone", help="Zone name or ID")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_firewall_stats)
+
+    # ── script ────────────────────────────────────────────────────────────────
+    psc = sub.add_parser("script", help="ThreatScript management")
+    scsub = psc.add_subparsers(dest="script_cmd", required=True, metavar="<subcommand>")
+
+    p = scsub.add_parser("push", help="Upload and load a ThreatScript (.star file)")
+    p.add_argument("file", help="Path to .star ThreatScript file")
+    p.add_argument("--id", help="Script ID (default: filename without extension)")
+    p.add_argument("--name", help="Friendly display name")
+    p.set_defaults(func=cmd_script_push)
+
+    p = scsub.add_parser("delete", help="Remove a loaded ThreatScript")
+    p.add_argument("script_id", help="Script ID")
+    p.set_defaults(func=cmd_script_delete)
+
+    p = scsub.add_parser("stats", help="Show firewall/script execution stats")
+    p.set_defaults(func=cmd_script_stats)
+
+    # ── server ────────────────────────────────────────────────────────────────
+    psv = sub.add_parser("server", help="DNS server (dnsscienced) management")
+    svsub = psv.add_subparsers(dest="server_cmd", required=True, metavar="<subcommand>")
+
+    p = svsub.add_parser("status", help="Server status and health")
+    p.set_defaults(func=cmd_server_status)
+
+    p = svsub.add_parser("stats", help="Server query statistics")
+    p.set_defaults(func=cmd_server_stats)
+
+    p = svsub.add_parser("metrics", help="Prometheus metrics (text format)")
+    p.set_defaults(func=cmd_server_metrics)
+
+    p = svsub.add_parser("reload", help="Reload server config without restart")
+    p.set_defaults(func=cmd_server_reload)
+
+    p = svsub.add_parser("license", help="Show license information")
+    p.set_defaults(func=cmd_server_license)
+
+    # ── cache ─────────────────────────────────────────────────────────────────
+    pca = sub.add_parser("cache", help="DNS cache management")
+    casub = pca.add_subparsers(dest="cache_cmd", required=True, metavar="<subcommand>")
+
+    p = casub.add_parser("stats", help="Cache hit rate and statistics")
+    p.set_defaults(func=cmd_cache_stats)
+
+    p = casub.add_parser("flush", help="Flush cache entries")
+    p.add_argument("--domain", help="Flush only entries for this domain")
+    p.add_argument("--type", help="Flush only this record type (A, AAAA, ...)")
+    p.add_argument("--exact", action="store_true", help="Exact domain match only (no subdomains)")
+    p.set_defaults(func=cmd_cache_flush)
+
+    p = casub.add_parser("lookup", help="Look up a cached entry")
+    p.add_argument("domain", help="Domain name to look up")
+    p.add_argument("--type", default="A", help="Record type (default: A)")
+    p.set_defaults(func=cmd_cache_lookup)
+
+    p = casub.add_parser("prefetch", help="Warm cache for a domain")
+    p.add_argument("domain", help="Domain name to prefetch")
+    p.add_argument("--type", help="Record type to prefetch")
+    p.set_defaults(func=cmd_cache_prefetch)
+
+    # ── domains ───────────────────────────────────────────────────────────────
+    pd = sub.add_parser("domains", help="Domain registration management")
+    dsub = pd.add_subparsers(dest="domains_cmd", required=True, metavar="<subcommand>")
+
+    p = dsub.add_parser("list", help="List registered domains")
+    p.set_defaults(func=cmd_domains_list)
+
+    p = dsub.add_parser("check", help="Check domain availability and price")
+    p.add_argument("domain", help="Domain name to check")
+    p.set_defaults(func=cmd_domains_check)
+
+    p = dsub.add_parser("nameservers", help="Update nameservers for a domain")
+    p.add_argument("domain", help="Domain name")
+    p.add_argument("--ns", required=True, action="append", metavar="NS",
+                   help="Nameserver (repeat for multiple: --ns ns1.example.com --ns ns2.example.com)")
+    p.set_defaults(func=cmd_domains_nameservers)
+
+    p = dsub.add_parser("auth-code", help="Get EPP auth code for domain transfer out")
+    p.add_argument("domain", help="Domain name")
+    p.set_defaults(func=cmd_domains_auth_code)
+
+    # ── ratelimit ─────────────────────────────────────────────────────────────
+    prl = sub.add_parser("ratelimit", help="DNS rate limiting (RRL) configuration")
+    rlsub = prl.add_subparsers(dest="ratelimit_cmd", required=True, metavar="<subcommand>")
+
+    p = rlsub.add_parser("get", help="Show rate limit settings")
+    p.set_defaults(func=cmd_ratelimit_get)
+
+    p = rlsub.add_parser("set", help="Configure rate limits")
+    p.add_argument("--qps", type=int, metavar="N", help="Max queries per second per client")
+    p.add_argument("--burst", type=int, metavar="N", help="Burst allowance")
+    p.add_argument("--enabled", type=lambda x: x.lower() == "true", metavar="true|false")
+    p.set_defaults(func=cmd_ratelimit_set)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        sys.exit(1)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
