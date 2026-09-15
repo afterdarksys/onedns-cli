@@ -4,10 +4,10 @@ Command-line interface for [onedns.io](https://onedns.io) — enterprise DNS man
 
 ## Installation
 
-**Requirements:** Python 3.8+, `requests` library
+**Requirements:** Python 3.10+, `requests>=2.33.0`, `urllib3>=2.7.0`
 
 ```bash
-pip install requests
+pip install 'requests>=2.33.0' 'urllib3>=2.7.0'
 curl -o /usr/local/bin/onedns https://raw.githubusercontent.com/afterdarksys/onedns-cli/main/onedns
 chmod +x /usr/local/bin/onedns
 ```
@@ -31,6 +31,22 @@ Set `ONEDNS_URL` to override the default endpoint (useful for self-hosted deploy
 
 ```bash
 export ONEDNS_URL=https://dns.yourcompany.com
+```
+
+TLS certificates are verified. For a private certificate authority, set
+`REQUESTS_CA_BUNDLE` to your CA bundle file. API redirects are refused; configure
+`ONEDNS_URL` with the final trusted endpoint. Requests use a 10-second connection
+timeout and a 30-second read timeout.
+
+Saved credentials are replaced atomically with owner-only permissions (`0600`).
+Run `onedns login` again to secure an existing credential file.
+
+## Tests
+
+Run the offline regression suite after installing `requests`:
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## Commands

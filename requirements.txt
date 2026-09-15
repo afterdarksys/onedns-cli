@@ -1,0 +1,3 @@
+# Security minimums for authenticated HTTP transport.
+requests>=2.33.0
+urllib3>=2.7.0

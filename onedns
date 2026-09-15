@@ -7,11 +7,10 @@ import json
 import argparse
 import configparser
 import getpass
+import tempfile
 from pathlib import Path
 
 import requests
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG_PATH = Path.home() / ".config" / "onedns" / "config"
 BASE_URL = os.environ.get("ONEDNS_URL", "https://onedns.io")
@@ -23,7 +22,7 @@ VERSION = "2.0.0"
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def _read_config():
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     if CONFIG_PATH.exists():
         cfg.read(CONFIG_PATH)
     return cfg
@@ -42,10 +41,18 @@ def load_api_key():
 
 def save_config(api_key):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     cfg["default"] = {"api_key": api_key}
-    with open(CONFIG_PATH, "w") as f:
-        cfg.write(f)
+    # mkstemp creates a private (0600) file before any credential is written.
+    # Replacing atomically also fixes permissions on existing config files.
+    fd, temporary_path = tempfile.mkstemp(dir=CONFIG_PATH.parent, prefix=".config-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            cfg.write(f)
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def clear_config():
@@ -62,7 +69,19 @@ def api(method, path, api_key=None, raw=False, **kwargs):
     headers = {"X-API-Key": api_key}
     if "json" in kwargs:
         headers["Content-Type"] = "application/json"
-    resp = requests.request(method, url, headers=headers, verify=False, **kwargs)
+    try:
+        resp = requests.request(
+            method, url, headers=headers, verify=True, timeout=(10, 30),
+            allow_redirects=False, **kwargs
+        )
+    except requests.exceptions.SSLError:
+        die("TLS certificate verification failed. Check the server certificate or REQUESTS_CA_BUNDLE.")
+    except requests.exceptions.Timeout:
+        die("API request timed out")
+    except requests.exceptions.RequestException:
+        die("Could not connect to the API")
+    if 300 <= resp.status_code < 400:
+        die("API redirect refused. Set ONEDNS_URL to the final trusted endpoint.")
     if resp.status_code == 401:
         die("Authentication failed — run: onedns login")
     if resp.status_code == 403:
